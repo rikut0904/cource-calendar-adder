@@ -1,0 +1,7 @@
+.env
+credentials.json
+.calendar-token.json
+.calendar-settings.json
+class-calendar-export*.json
+.gocache/
+.gomodcache/
