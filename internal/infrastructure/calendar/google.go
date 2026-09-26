@@ -48,6 +48,15 @@ type createdEvent struct {
 	HTML string `json:"htmlLink"`
 }
 
+type eventInstancesResponse struct {
+	Items []eventInstance `json:"items"`
+}
+
+type eventInstance struct {
+	ID                string        `json:"id"`
+	OriginalStartTime eventDateTime `json:"originalStartTime"`
+}
+
 func NewGoogle(ctx context.Context, credentialsPath, calendarID, timeZone, tokenPath string) (*Google, error) {
 	credentials, err := os.ReadFile(credentialsPath)
 	if err != nil {
@@ -161,6 +170,11 @@ func (g *Google) CreateLesson(lesson domain.Lesson) (string, error) {
 			if err := json.Unmarshal(responseBody, &created); err != nil {
 				return "", fmt.Errorf("decode calendar response: %w", err)
 			}
+			if len(lesson.ExcludeOccurrences) > 0 {
+				if err := g.cancelOccurrences(created.ID, lesson.ExcludeOccurrences); err != nil {
+					return "", err
+				}
+			}
 			return created.HTML, nil
 		}
 		message := strings.TrimSpace(string(responseBody))
@@ -171,6 +185,65 @@ func (g *Google) CreateLesson(lesson domain.Lesson) (string, error) {
 		return "", fmt.Errorf("calendar API returned %s: %s", resp.Status, message)
 	}
 	return "", fmt.Errorf("calendar request retry limit exceeded")
+}
+
+func (g *Google) cancelOccurrences(eventID string, dates []time.Time) error {
+	base := "https://www.googleapis.com/calendar/v3/calendars/" + url.PathEscape(g.calendarID) + "/events/" + url.PathEscape(eventID) + "/instances"
+	for _, date := range dates {
+		dayStart := time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, date.Location())
+		dayEnd := dayStart.AddDate(0, 0, 1)
+		query := url.Values{}
+		query.Set("timeMin", dayStart.Format(time.RFC3339))
+		query.Set("timeMax", dayEnd.Format(time.RFC3339))
+		query.Set("showDeleted", "false")
+		req, err := http.NewRequest(http.MethodGet, base+"?"+query.Encode(), nil)
+		if err != nil {
+			return fmt.Errorf("create recurring instance request: %w", err)
+		}
+		resp, err := g.httpClient.Do(req)
+		if err != nil {
+			return fmt.Errorf("list recurring instances: %w", err)
+		}
+		body, readErr := io.ReadAll(io.LimitReader(resp.Body, 32<<10))
+		resp.Body.Close()
+		if readErr != nil {
+			return fmt.Errorf("read recurring instances: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("calendar instances API returned %s: %s", resp.Status, strings.TrimSpace(string(body)))
+		}
+		var instances eventInstancesResponse
+		if err := json.Unmarshal(body, &instances); err != nil {
+			return fmt.Errorf("decode recurring instances: %w", err)
+		}
+		for _, instance := range instances.Items {
+			if instance.ID == "" {
+				continue
+			}
+			instanceTime, err := time.Parse(time.RFC3339, instance.OriginalStartTime.DateTime)
+			if err != nil || instanceTime.In(date.Location()).Format("2006-01-02") != date.Format("2006-01-02") {
+				continue
+			}
+			deleteURL := "https://www.googleapis.com/calendar/v3/calendars/" + url.PathEscape(g.calendarID) + "/events/" + url.PathEscape(eventID) + "/instances/" + url.PathEscape(instance.ID)
+			deleteReq, err := http.NewRequest(http.MethodDelete, deleteURL, nil)
+			if err != nil {
+				return fmt.Errorf("create recurring instance delete request: %w", err)
+			}
+			deleteResp, err := g.httpClient.Do(deleteReq)
+			if err != nil {
+				return fmt.Errorf("delete recurring instance: %w", err)
+			}
+			deleteBody, deleteReadErr := io.ReadAll(io.LimitReader(deleteResp.Body, 8<<10))
+			deleteResp.Body.Close()
+			if deleteReadErr != nil {
+				return fmt.Errorf("read recurring instance delete response: %w", deleteReadErr)
+			}
+			if deleteResp.StatusCode < 200 || deleteResp.StatusCode >= 300 {
+				return fmt.Errorf("calendar instance delete returned %s: %s", deleteResp.Status, strings.TrimSpace(string(deleteBody)))
+			}
+		}
+	}
+	return nil
 }
 
 func retryableCalendarResponse(status int, message string) bool {

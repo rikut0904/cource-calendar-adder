@@ -28,7 +28,10 @@ const (
 	screenImport
 )
 
-type period struct{ Start, End string }
+type period struct {
+	Start string `json:"start"`
+	End   string `json:"end"`
+}
 
 var defaultPeriods = []period{{"08:40", "10:20"}, {"10:35", "12:15"}, {"13:15", "14:55"}, {"15:10", "16:50"}, {"17:05", "18:45"}}
 
@@ -46,6 +49,12 @@ type courseInput struct {
 	Teacher  string
 	Location string
 	Note     string
+}
+
+type weekdayMove struct {
+	destination   time.Time
+	original      time.Time
+	sourceWeekday time.Weekday
 }
 
 type exceptionSettings struct {
@@ -933,21 +942,23 @@ func (m calendarModel) courseLessons(course courseInput) ([]domain.Lesson, error
 		return nil, fmt.Errorf("学期内に授業曜日がありません")
 	}
 	p := m.settings.Periods[periodNumber-1]
-	start, end, err := timesOnDate(firstDate, p.Start, p.End, loc)
+	weekdayMoves, err := m.parseWeekdayMoves(startDate, endDate, weekday, loc)
 	if err != nil {
 		return nil, err
 	}
-	recurrence := []string{fmt.Sprintf("RRULE:FREQ=WEEKLY;BYDAY=%s;UNTIL=%s", weekdayCode(weekday), endDate.In(time.UTC).Format("20060102T150405Z"))}
-	var moved []domain.Lesson
-	for date := startDate; !date.After(endDate); date = date.AddDate(0, 0, 1) {
-		if date.Weekday() != weekday {
-			continue
-		}
-		dateKey := date.Format("2006-01-02")
-		if (m.exceptions.SkipWeekends && isWeekend(date)) || manualHolidays[dateKey] || isJapaneseHoliday(date) {
-			recurrence = append(recurrence, exdate(m.timeZone, date, p.Start))
-		}
+	recurring, err := m.recurringLessons(course, weekday, firstDate, endDate, p, manualHolidays, weekdayMoves, loc)
+	if err != nil {
+		return nil, err
 	}
+	moved, err := m.movedLessons(course, p, weekdayMoves, manualHolidays, loc)
+	if err != nil {
+		return nil, err
+	}
+	return append(recurring, moved...), nil
+}
+
+func (m calendarModel) parseWeekdayMoves(startDate, endDate time.Time, weekday time.Weekday, loc *time.Location) ([]weekdayMove, error) {
+	moves := make([]weekdayMove, 0)
 	for _, change := range splitCSV(m.exceptions.WeekdayChanges) {
 		parts := strings.SplitN(change, "=", 2)
 		if len(parts) != 2 {
@@ -961,23 +972,61 @@ func (m calendarModel) courseLessons(course courseInput) ([]domain.Lesson, error
 		if err != nil {
 			return nil, err
 		}
-		if destination.Before(startDate) || destination.After(endDate) || sourceWeekday != weekday {
+		if destination.Before(startDate) || destination.After(endDate) {
 			continue
 		}
-		// Find the original weekday in the week containing the destination date.
 		weekStart := destination.AddDate(0, 0, -((int(destination.Weekday()) + 6) % 7))
 		original := weekStart.AddDate(0, 0, (int(sourceWeekday)+6)%7)
-		recurrence = append(recurrence, exdate(m.timeZone, original, p.Start))
-		if (m.exceptions.SkipWeekends && isWeekend(destination)) || manualHolidays[destination.Format("2006-01-02")] || isJapaneseHoliday(destination) {
+		moves = append(moves, weekdayMove{destination: destination, original: original, sourceWeekday: sourceWeekday})
+	}
+	return moves, nil
+}
+
+func (m calendarModel) recurringLessons(course courseInput, weekday time.Weekday, firstDate, endDate time.Time, p period, manualHolidays map[string]bool, moves []weekdayMove, loc *time.Location) ([]domain.Lesson, error) {
+	start, end, err := timesOnDate(firstDate, p.Start, p.End, loc)
+	if err != nil {
+		return nil, err
+	}
+	recurrence := []string{fmt.Sprintf("RRULE:FREQ=WEEKLY;BYDAY=%s;UNTIL=%s", weekdayCode(weekday), endDate.In(time.UTC).Format("20060102T150405Z"))}
+	for date := firstDate; !date.After(endDate); date = date.AddDate(0, 0, 7) {
+		dateKey := date.Format("2006-01-02")
+		if manualHolidays[dateKey] || isJapaneseHoliday(date) {
+			recurrence = append(recurrence, exdate(m.timeZone, date, p.Start))
+		}
+	}
+	var excluded []time.Time
+	for _, move := range moves {
+		// The date on the left side is the timetable date being replaced.
+		// Exclude it only for courses whose normal weekday is that date's
+		// weekday; the source weekday is added as a moved single event.
+		if move.destination.Weekday() == weekday && !move.destination.Before(firstDate) && !move.destination.After(endDate) {
+			excluded = append(excluded, move.destination)
+			recurrence = append(recurrence, exdate(m.timeZone, move.destination, p.Start))
+		}
+	}
+	return []domain.Lesson{{Title: course.Title, Teacher: course.Teacher, Start: start, End: end, Location: course.Location, Description: course.Note, Recurrence: recurrence, ExcludeOccurrences: excluded}}, nil
+}
+
+func (m calendarModel) movedLessons(course courseInput, p period, moves []weekdayMove, manualHolidays map[string]bool, loc *time.Location) ([]domain.Lesson, error) {
+	weekday, err := parseWeekday(course.Weekday)
+	if err != nil {
+		return nil, err
+	}
+	moved := make([]domain.Lesson, 0, len(moves))
+	for _, move := range moves {
+		if move.sourceWeekday != weekday {
 			continue
 		}
-		movedStart, movedEnd, err := timesOnDate(destination, p.Start, p.End, loc)
+		if (m.exceptions.SkipWeekends && isWeekend(move.destination)) || manualHolidays[move.destination.Format("2006-01-02")] || isJapaneseHoliday(move.destination) {
+			continue
+		}
+		start, end, err := timesOnDate(move.destination, p.Start, p.End, loc)
 		if err != nil {
 			return nil, err
 		}
-		moved = append(moved, domain.Lesson{Title: course.Title + "（曜日変更）", Teacher: course.Teacher, Start: movedStart, End: movedEnd, Location: course.Location, Description: fmt.Sprintf("%s曜日の授業を%sへ変更\n%s", weekdayName(sourceWeekday), destination.Format("2006-01-02"), course.Note)})
+		moved = append(moved, domain.Lesson{Title: course.Title + "（曜日変更）", Teacher: course.Teacher, Start: start, End: end, Location: course.Location, Description: fmt.Sprintf("%s曜日の授業を%sへ変更\n%s", weekdayName(move.sourceWeekday), move.destination.Format("2006-01-02"), course.Note)})
 	}
-	return append([]domain.Lesson{{Title: course.Title, Teacher: course.Teacher, Start: start, End: end, Location: course.Location, Description: course.Note, Recurrence: recurrence}}, moved...), nil
+	return moved, nil
 }
 
 func (m calendarModel) manualHolidaySet(loc *time.Location) (map[string]bool, error) {

@@ -25,7 +25,7 @@ func TestCourseLessonsCreatesWeeklySeriesAndMove(t *testing.T) {
 	if len(lessons[0].Recurrence) != 3 || lessons[0].Start.Format("15:04") != "08:40" || lessons[0].End.Format("15:04") != "10:20" {
 		t.Fatalf("unexpected recurrence: %#v", lessons[0].Recurrence)
 	}
-	if !strings.Contains(lessons[0].Recurrence[1], "T084000") {
+	if !strings.HasPrefix(lessons[0].Recurrence[1], "EXDATE;TZID=Asia/Tokyo:") || !strings.Contains(lessons[0].Recurrence[1], "T084000") {
 		t.Fatalf("invalid EXDATE format: %#v", lessons[0].Recurrence)
 	}
 	if lessons[0].Teacher != "山田先生" {
@@ -35,10 +35,18 @@ func TestCourseLessonsCreatesWeeklySeriesAndMove(t *testing.T) {
 	m.exceptions = exceptionSettings{Holidays: "2026-04-06", WeekdayChanges: "2026-04-08=月"}
 	lessons, err = m.courseLessons(courseInput{Title: "数学", Weekday: "月", Period: "1"})
 	if err != nil || len(lessons) != 2 {
-		t.Fatalf("got lessons=%d err=%v, want weekly series and one weekday-change event", len(lessons), err)
+		t.Fatalf("got lessons=%d err=%v, want weekly event and moved event", len(lessons), err)
 	}
-	if len(lessons[0].Recurrence) != 5 || lessons[1].Start.Format("2006-01-02") != "2026-04-08" {
-		t.Fatalf("unexpected exceptions: recurrence=%#v moved=%+v", lessons[0].Recurrence, lessons[1])
+	if len(lessons[0].Recurrence) == 0 || len(lessons[0].ExcludeOccurrences) != 0 {
+		t.Fatalf("source weekday should not be cancelled for Monday course: %+v", lessons[0])
+	}
+	if lessons[1].Start.Format("2006-01-02") != "2026-04-08" || !strings.Contains(lessons[1].Title, "曜日変更") {
+		t.Fatalf("weekday-change destination was not created: %+v", lessons[1])
+	}
+
+	wednesdayLessons, err := m.courseLessons(courseInput{Title: "英語", Weekday: "水", Period: "1"})
+	if err != nil || len(wednesdayLessons) != 1 || len(wednesdayLessons[0].ExcludeOccurrences) != 1 || wednesdayLessons[0].ExcludeOccurrences[0].Format("2006-01-02") != "2026-04-08" {
+		t.Fatalf("destination weekday was not excluded from Wednesday course: lessons=%+v err=%v", wednesdayLessons, err)
 	}
 }
 

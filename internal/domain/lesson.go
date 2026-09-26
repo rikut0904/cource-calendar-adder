@@ -12,4 +12,6 @@ type Lesson struct {
 	Location    string
 	// Recurrence contains Google Calendar recurrence rules. Empty means one event.
 	Recurrence []string
+	// ExcludeOccurrences are recurring instances to cancel after creation.
+	ExcludeOccurrences []time.Time
 }

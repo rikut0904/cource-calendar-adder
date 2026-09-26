@@ -42,39 +42,58 @@ func (a LessonAdder) AddAllProgress(lessons []domain.Lesson, progress func(compl
 	if len(lessons) == 0 {
 		return results
 	}
-	workerCount := 3
-	if len(lessons) < workerCount {
-		workerCount = len(lessons)
-	}
-	jobs := make(chan int)
-	var wg sync.WaitGroup
 	var progressMu sync.Mutex
 	completed := 0
-	for worker := 0; worker < workerCount; worker++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for i := range jobs {
-				lesson := lessons[i]
-				link, err := a.Add(lesson)
-				result := AddResult{Lesson: lesson, Link: link, Err: err}
-				results[i] = result
-				if progress != nil {
-					progressMu.Lock()
-					completed++
-					current := completed
-					progressMu.Unlock()
-					progress(current, len(lessons), result)
+
+	// Recurring events are completed first. This is important for weekday
+	// changes: their original instances must be cancelled before the moved
+	// single events are created.
+	var recurring, singles []int
+	for i, lesson := range lessons {
+		if len(lesson.Recurrence) > 0 {
+			recurring = append(recurring, i)
+		} else {
+			singles = append(singles, i)
+		}
+	}
+	registerBatch := func(indices []int) {
+		if len(indices) == 0 {
+			return
+		}
+		workerCount := 3
+		if len(indices) < workerCount {
+			workerCount = len(indices)
+		}
+		jobs := make(chan int)
+		var wg sync.WaitGroup
+		for worker := 0; worker < workerCount; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					lesson := lessons[i]
+					link, err := a.Add(lesson)
+					result := AddResult{Lesson: lesson, Link: link, Err: err}
+					results[i] = result
+					if progress != nil {
+						progressMu.Lock()
+						completed++
+						current := completed
+						progressMu.Unlock()
+						progress(current, len(lessons), result)
+					}
 				}
+			}()
+		}
+		go func() {
+			defer close(jobs)
+			for _, i := range indices {
+				jobs <- i
 			}
 		}()
+		wg.Wait()
 	}
-	go func() {
-		defer close(jobs)
-		for i := range lessons {
-			jobs <- i
-		}
-	}()
-	wg.Wait()
+	registerBatch(recurring)
+	registerBatch(singles)
 	return results
 }
